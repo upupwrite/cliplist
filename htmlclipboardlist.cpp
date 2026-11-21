@@ -43,13 +43,13 @@ QString plainTextToHtml(const QString &text)
 
     for (const QChar c : text) {
         switch (c.unicode()) {
-        case QLatin1Char('&'): html += QLatin1String("&amp;"); break;
-        case QLatin1Char('<'): html += QLatin1String("&lt;"); break;
-        case QLatin1Char('>'): html += QLatin1String("&gt;"); break;
-        case QLatin1Char('"'): html += QLatin1String("&quot;"); break;
-        case QLatin1Char('\n'): html += QLatin1String("<br />"); break;
-        case QLatin1Char('\t'): html += QLatin1String("&nbsp;&nbsp;&nbsp;&nbsp;"); break;
-        case QLatin1Char(' '): html += QLatin1String("&nbsp;"); break;
+        case u'&': html += QLatin1String("&amp;"); break;
+        case u'<': html += QLatin1String("&lt;"); break;
+        case u'>': html += QLatin1String("&gt;"); break;
+        case u'"': html += QLatin1String("&quot;"); break;
+        case u'\n': html += QLatin1String("<br />"); break;
+        case u'\t': html += QLatin1String("&nbsp;&nbsp;&nbsp;&nbsp;"); break;
+        case u' ': html += QLatin1String("&nbsp;"); break;
         default: html += c; break;
         }
     }
@@ -152,8 +152,6 @@ HtmlItemDelegate::~HtmlItemDelegate()
 
 void HtmlItemDelegate::setView(QAbstractItemView *view)
 {
-    QStyledItemDelegate::setView(view);
-
     purgeAll();
     m_view = qobject_cast<QListView*>(view);
     if (!m_view)
@@ -454,7 +452,7 @@ HtmlItemDelegate::prepareCache(int row, const QStyleOptionViewItem &option, int 
     return &cache;
 }
 
-QUrl HtmlItemDelegate::urlAt(const Cache &cache, const QStyleOptionViewItem &option,
+QUrl HtmlItemDelegate::urlAt(const Cache &cache, const QStyleOptionViewItem &,
                              const QPointF &pos, bool selected) const
 {
     QTextDocument *document = selected && cache.selectedDocument
@@ -466,11 +464,7 @@ QUrl HtmlItemDelegate::urlAt(const Cache &cache, const QStyleOptionViewItem &opt
     if (pos.x() < 0 || pos.y() < 0)
         return QUrl();
 
-    const QTextCursor cursor = document->documentLayout()->hitTest(pos, Qt::FuzzyHit);
-    if (cursor.isNull())
-        return QUrl();
-
-    const QString href = cursor.currentCharFormat().anchorHref();
+    const QString href = document->documentLayout()->anchorAt(pos);
     return href.isEmpty() ? QUrl() : QUrl(href);
 }
 
@@ -478,7 +472,7 @@ void HtmlItemDelegate::paint(QPainter *painter, const QStyleOptionViewItem &opti
                              const QModelIndex &index) const
 {
     const bool selected = option.state & QStyle::State_Selected;
-    const bool current = option.state & QStyle::State_CurrentItem;
+    const bool current = option.state & QStyle::State_HasFocus;
 
     QPalette palette = option.palette;
 
@@ -487,7 +481,7 @@ void HtmlItemDelegate::paint(QPainter *painter, const QStyleOptionViewItem &opti
 
     // 背景：选中高亮 > 交替行 > 底色
     QColor background = palette.color(QPalette::Base);
-    if (option.features & QStyleOptionViewItem::AlternateBackground)
+    if (option.features & QStyleOptionViewItem::Alternate)
         background = background.darker(104);
     if (selected)
         background = palette.color(QPalette::Highlight);
@@ -552,7 +546,7 @@ void HtmlItemDelegate::paint(QPainter *painter, const QStyleOptionViewItem &opti
     painter->save();
     painter->translate(x, option.rect.top() + m_margin);
     painter->setClipRect(0, 0, width, shownHeight);
-    document->draw(painter);
+    document->drawContents(painter);
 
     // 折叠遮罩：底部渐变 + 提示文字
     if (m_maxItemHeight > 0 && !cache->expanded && cache->fullHeight > m_maxItemHeight) {
@@ -694,6 +688,7 @@ void HtmlClipboardList::init()
 
     m_renderer = new HtmlItemDelegate(this);
     setItemDelegate(m_renderer);
+    m_renderer->setView(this);
 
     connect(m_renderer, &HtmlItemDelegate::sizeHintChanged,
             this, [this](const QModelIndex &) { doItemsLayout(); });
@@ -708,10 +703,10 @@ void HtmlClipboardList::init()
         if (index.isValid())
             emit recordActivated(index.row(), recordAt(index.row()));
     });
-    connect(this, &QListWidget::rowsInserted, this, [this]() {
+    connect(model(), &QAbstractItemModel::rowsInserted, this, [this]() {
         emit recordCountChanged(count());
     });
-    connect(this, &QListWidget::rowsRemoved, this, [this]() {
+    connect(model(), &QAbstractItemModel::rowsRemoved, this, [this]() {
         emit recordCountChanged(count());
     });
     connect(this, &QListWidget::itemSelectionChanged, this,
@@ -805,11 +800,11 @@ int HtmlClipboardList::appendFromMimeData(const QMimeData *mimeData)
     record.timestamp = QDateTime::currentMSecsSinceEpoch();
 
     const auto formats = mimeData->formats();
-    for (const QByteArray &format : formats) {
+    for (const QString &format : formats) {
         const QByteArray data = mimeData->data(format);
         if (data.isEmpty())
             continue;
-        record.formats.insert(QString::fromLatin1(format), data);
+        record.formats.insert(format, data);
     }
 
     if (mimeData->hasHtml())
@@ -1110,8 +1105,11 @@ bool HtmlClipboardList::inFadeStrip(const QPoint &pos) const
     if (m_renderer->maxItemHeight() <= 0)
         return false;
 
-    const int row = rowAt(pos.y());
-    if (row < 0 || isRowExpanded(row))
+    const QModelIndex hitIndex = indexAt(QPoint(0, pos.y()));
+    if (!hitIndex.isValid())
+        return false;
+    const int row = hitIndex.row();
+    if (isRowExpanded(row))
         return false;
 
     const int viewWidth = viewport()->contentsRect().width();
@@ -1129,7 +1127,7 @@ bool HtmlClipboardList::inFadeStrip(const QPoint &pos) const
 void HtmlClipboardList::mousePressEvent(QMouseEvent *event)
 {
     if (event->button() == Qt::LeftButton && inFadeStrip(event->pos())) {
-        const int row = rowAt(event->pos().y());
+        const int row = indexAt(QPoint(0, event->pos().y())).row();
         setRowExpanded(row, true);
         return;
     }
@@ -1159,7 +1157,7 @@ void HtmlClipboardList::contextMenuEvent(QContextMenuEvent *event)
     actClear->setEnabled(count() > 0);
 
 #if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
-    QAction *chosen = menu.exec(event->globalPosition().toPoint());
+    QAction *chosen = menu.exec(event->globalPos());
 #else
     QAction *chosen = menu.exec(event->globalPos());
 #endif

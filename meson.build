@@ -16,6 +16,8 @@ moc_files=qt6.compile_moc(
 
 sources = [
   'main.cpp',
+  'cliplist.cpp',
+  'htmlclipboardlist.cpp',
 ]
 
 exe = executable(
