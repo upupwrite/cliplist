@@ -779,6 +779,9 @@ void HtmlClipboardList::fillItem(QListWidgetItem *item,
 	item->setData(ExpandedRole, false);
 	item->setData(LabelRole, record.label);
 	item->setData(IdRole, record.id);
+	item->setData(PinnedRole, record.pin);
+	// pinrow 仅在固定时才写入，避免把 0 当成“第 0 行”
+	item->setData(PinRowRole, record.pin ? record.pinrow : -1);
 	item->setData(Qt::DisplayRole, QVariant()); // 内容一律由 delegate 绘制
 	item->setData(Qt::TextAlignmentRole, QVariant());
 	item->setToolTip(QString());
@@ -788,15 +791,23 @@ int HtmlClipboardList::insertRecord(int row, const HtmlClipboardItem &record) {
 	if (!record.isValid())
 		return -1;
 
-	const quint32 hash =
-		record.hash ? record.hash : contentHash(record.text, record.html);
+	HtmlClipboardItem rec = record;
+	if (rec.hash == 0)
+		rec.hash = contentHash(rec.text, rec.html);
+
+	if (rec.id <= 0) {
+		while (rowForId(m_nextAutoId) >= 0)
+			++m_nextAutoId;
+		rec.id = m_nextAutoId++;
+	} else if (rec.id >= m_nextAutoId) {
+		m_nextAutoId = rec.id + 1;
+	}
 
 	if (m_ignoreDuplicates) {
 		for (int i = 0; i < count(); ++i) {
-			if (item(i)->data(HashRole).toUInt() == hash) {
+			if (item(i)->data(HashRole).toUInt() == rec.hash) {
 				moveToTop(i);
-				// setCurrentRow(i);
-				return i;
+				return rowForId(rec.id); // 见下方 moveToTop 说明
 			}
 		}
 	}
@@ -804,21 +815,24 @@ int HtmlClipboardList::insertRecord(int row, const HtmlClipboardItem &record) {
 	allocateSpaceForNewItems(1);
 
 	auto *item = new QListWidgetItem();
-	fillItem(item, record);
-	item->setData(HashRole, hash);
+	fillItem(item, rec);
+	item->setData(HashRole, rec.hash);
 
 	const int target = (row < 0 || row > count()) ? 0 : row;
 	insertItem(target, item);
 
 	if (!m_filterText.isEmpty())
-		setRowHidden(target, !matchFilter(record));
+		setRowHidden(target, !matchFilter(rec));
+
+	// 关键：新行插入可能把固定项顶走，立刻对齐。
+	relocatePinnedRows();
 
 	updateTextWidth();
 	doItemsLayout();
 
-	// setCurrentRow(target);
 	scrollToItem(item, QAbstractItemView::PositionAtTop);
-	return target;
+	// 返回该记录当前实际行（relocate 后可能变化）。
+	return rowForId(rec.id);
 }
 
 int HtmlClipboardList::appendRecord(const HtmlClipboardItem &record) {
@@ -906,13 +920,17 @@ bool HtmlClipboardList::moveToTop(int row) {
 		return false;
 	if (row == 0)
 		return true;
+	// 固定项由 relocatePinnedRows 维护位置，moveToTop 会立刻被它挪回去，
+	// 因此直接拒绝，语义更清晰。
+	if (isRecordPinned(row))
+		return false;
 
 	QListWidgetItem *item = takeItem(row);
 	insertItem(0, item);
+	relocatePinnedRows();
 	doItemsLayout();
 	return true;
 }
-
 HtmlClipboardItem HtmlClipboardList::recordAt(int row) const {
 	HtmlClipboardItem record;
 	const QListWidgetItem *item = this->item(row);
@@ -926,6 +944,9 @@ HtmlClipboardItem HtmlClipboardList::recordAt(int row) const {
 	record.note = item->data(NoteRole).toString();
 	record.label = item->data(LabelRole).toString();
 	record.hash = item->data(HashRole).toUInt();
+	record.id = item->data(IdRole).toInt();
+	record.pin = item->data(PinnedRole).toBool();
+	record.pinrow = item->data(PinRowRole).toInt();
 	return record;
 }
 
@@ -934,20 +955,45 @@ QVariantMap HtmlClipboardList::formatsAt(int row) const {
 	return item ? item->data(FormatsRole).toMap() : QVariantMap();
 }
 
-int HtmlClipboardList::removeSelected() {
-	const auto items = selectedItems();
-	const int removed = items.size();
-	qDeleteAll(items);
-	if (removed > 0)
-		emit recordRemoved(removed);
-	return removed;
+int HtmlClipboardList::recordIdAt(int row) const {
+	const QListWidgetItem *it = this->item(row);
+	return it ? it->data(IdRole).toInt() : -1;
+}
+
+int HtmlClipboardList::rowForId(int id) const {
+	if (id <= 0)
+		return -1;
+	for (int i = 0; i < count(); ++i) {
+		if (item(i)->data(IdRole).toInt() == id)
+			return i;
+	}
+	return -1;
+}
+
+int HtmlClipboardList::recordPinRow(int row) const {
+	const QListWidgetItem *it = this->item(row);
+	if (!it || !it->data(PinnedRole).toBool())
+		return -1;
+	return it->data(PinRowRole).toInt();
 }
 
 void HtmlClipboardList::removeRow(int row) {
 	if (row < 0 || row >= count())
 		return;
 	delete item(row);
+	relocatePinnedRows();
 	emit recordRemoved(1);
+}
+
+int HtmlClipboardList::removeSelected() {
+	const auto items = selectedItems();
+	const int removed = items.size();
+	qDeleteAll(items);
+	if (removed > 0) {
+		relocatePinnedRows();
+		emit recordRemoved(removed);
+	}
+	return removed;
 }
 
 void HtmlClipboardList::setMaxRecords(int maxRecords) {
@@ -1108,24 +1154,70 @@ bool HtmlClipboardList::isRowExpanded(int row) const {
 	return item ? item->data(ExpandedRole).toBool() : false;
 }
 
-void HtmlClipboardList::setRecordPinned(int row, bool pinned) {
-	QListWidgetItem *item = this->item(row);
-	if (!item || item->data(PinnedRole).toBool() == pinned)
+// ---- 固定 ----------------------------------------------------------------
+void HtmlClipboardList::setRecordPinned(int row, int id, bool pinned) {
+	// 语义：
+	//   row    —— 条目“应占据的行位置”（pinrow），固定后由 relocatePinnedRows()
+	//             把它真正挪到该行；其他条目插入/删除时它会被自动纠正回来。
+	//   id     —— 记录唯一标识，优先据此定位 item；若无效/找不到则回退按 row
+	//             查找（兼容旧式调用）。
+	//   pinned —— true 固定，false 取消。
+	int targetRow = (id > 0) ? rowForId(id) : -1;
+	if (targetRow < 0 && row >= 0 && row < count())
+		targetRow = row;
+	if (targetRow < 0)
 		return;
 
-	item->setData(PinnedRole, pinned);
-	m_renderer->invalidateRow(model()->index(row, 0));
+	QListWidgetItem *target = item(targetRow);
+	if (!target)
+		return;
+
+	const int actualId = target->data(IdRole).toInt();
+	const bool wasPinned = target->data(PinnedRole).toBool();
+
+	if (wasPinned == pinned) {
+		// 状态未变；若已固定则允许更新 pinrow（用户可能想把它挪到新行）。
+		if (pinned) {
+			target->setData(PinRowRole, row);
+			relocatePinnedRows();
+		}
+		return;
+	}
+
+	target->setData(PinnedRole, pinned);
+	target->setData(PinRowRole, pinned ? QVariant(row) : QVariant(-1));
+
+	m_renderer->invalidateRow(model()->index(targetRow, 0));
 	doItemsLayout();
-	emit recordPinnedChanged(row, pinned);
+
+	// 关键：固定后立即把它挪到 row 位置（并把其它固定项按 pinrow 重排）。
+	if (pinned)
+		relocatePinnedRows();
+
+	emit recordPinnedChanged(rowForId(actualId), actualId, pinned);
 }
 
 bool HtmlClipboardList::isRecordPinned(int row) const {
-	const QListWidgetItem *item = this->item(row);
-	return item ? item->data(PinnedRole).toBool() : false;
+	const QListWidgetItem *it = this->item(row);
+	return it ? it->data(PinnedRole).toBool() : false;
+}
+
+bool HtmlClipboardList::isRecordPinnedById(int id) const {
+	const int row = rowForId(id);
+	return row >= 0 && isRecordPinned(row);
 }
 
 void HtmlClipboardList::toggleRecordPinned(int row) {
-	setRecordPinned(row, !isRecordPinned(row));
+	const int id = recordIdAt(row);
+	// 切换时把当前行作为 pinrow（“固定到现在的位置”），
+	// 需要“固定到指定位置”的调用方应直接走 setRecordPinned。
+	setRecordPinned(row, id, !isRecordPinned(row));
+}
+
+void HtmlClipboardList::toggleRecordPinnedById(int id) {
+	const int row = rowForId(id);
+	if (row >= 0)
+		setRecordPinned(row, id, !isRecordPinned(row));
 }
 
 int HtmlClipboardList::pinnedCount() const {
@@ -1136,6 +1228,8 @@ int HtmlClipboardList::pinnedCount() const {
 	}
 	return pinned;
 }
+
+// ---- 用户标签 ------------------------------------------------------------
 
 void HtmlClipboardList::setRecordLabel(int row, const QString &label) {
 	QListWidgetItem *item = this->item(row);
@@ -1237,7 +1331,9 @@ void HtmlClipboardList::contextMenuEvent(QContextMenuEvent *event) {
 	} else if (chosen == actExpand) {
 		setRowExpanded(row, !isRowExpanded(row));
 	} else if (chosen == actPin) {
-		setRecordPinned(row, actPin->isChecked());
+		// 通过 id 精确定位，避免期间行重排导致 row 漂移；
+		// row 保留为该条目“应固定的位置”（pinrow）。
+		setRecordPinned(row, recordIdAt(row), actPin->isChecked());
 	} else if (chosen == actLabel) {
 		bool ok = false;
 		const QString label =
@@ -1252,6 +1348,9 @@ void HtmlClipboardList::contextMenuEvent(QContextMenuEvent *event) {
 		clear();
 		if (removed > 0)
 			emit recordRemoved(removed);
+	} else if (chosen == actPin) {
+		// row 作为 pinrow（让条目固定在当前行），id 用于精确定位。
+		setRecordPinned(row, recordIdAt(row), actPin->isChecked());
 	}
 }
 
@@ -1273,4 +1372,82 @@ void HtmlClipboardList::keyPressEvent(QKeyEvent *event) {
 		}
 	}
 	QListWidget::keyPressEvent(event);
+}
+void HtmlClipboardList::relocatePinnedRows() {
+	if (m_relocatingPinned)
+		return;
+
+	struct PinnedInfo {
+		int id;
+		int pinrow;
+		int currentRow;
+	};
+
+	QList<PinnedInfo> infos;
+	infos.reserve(count());
+	for (int r = 0; r < count(); ++r) {
+		const QListWidgetItem *it = item(r);
+		if (!it || !it->data(PinnedRole).toBool())
+			continue;
+		infos.append(
+			{it->data(IdRole).toInt(), it->data(PinRowRole).toInt(), r});
+	}
+	if (infos.isEmpty())
+		return;
+
+	// 计算目标位置：按 pinrow 升序，冲突顺延；若实际位置已全部吻合则跳过。
+	// 排序：pinrow 升序，同 pinrow 时当前行小者优先（先来先占）。
+	std::sort(infos.begin(), infos.end(),
+			  [](const PinnedInfo &a, const PinnedInfo &b) {
+				  if (a.pinrow != b.pinrow)
+					  return a.pinrow < b.pinrow;
+				  return a.currentRow < b.currentRow;
+			  });
+
+	// 预演目标行位置，判断是否需要 relocate。
+	QList<int> targets;
+	targets.reserve(infos.size());
+	int nextFree = 0;
+	bool needsMove = false;
+	for (const PinnedInfo &info : infos) {
+		int target = qMax(info.pinrow, nextFree);
+		target = qMin(target, count() - 1);
+		targets.append(target);
+		nextFree = target + 1;
+		if (target != info.currentRow)
+			needsMove = true;
+	}
+	if (!needsMove)
+		return;
+
+	// 按当前行降序 take（从底部往上取，避免索引失效）。
+	QList<PinnedInfo> byCurrent = infos;
+	std::sort(byCurrent.begin(), byCurrent.end(),
+			  [](const PinnedInfo &a, const PinnedInfo &b) {
+				  return a.currentRow > b.currentRow;
+			  });
+
+	m_relocatingPinned = true;
+
+	QHash<int, QListWidgetItem *> pending;
+	pending.reserve(infos.size());
+	for (const PinnedInfo &info : byCurrent) {
+		QListWidgetItem *it = takeItem(info.currentRow);
+		if (it)
+			pending.insert(info.id, it);
+	}
+
+	// 按 pinrow 升序插回，目标行号已预演，直接落位。
+	for (int i = 0; i < infos.size(); ++i) {
+		QListWidgetItem *it = pending.take(infos[i].id);
+		if (!it)
+			continue;
+		int target = targets[i];
+		target = qMin(target, count());
+		insertItem(target, it);
+	}
+
+	m_relocatingPinned = false;
+
+	doItemsLayout();
 }

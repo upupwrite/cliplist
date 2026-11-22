@@ -83,7 +83,8 @@ enum HtmlClipboardRole {
 	ExpandedRole,				 ///< bool 超长内容是否展开
 	PinnedRole,					 ///< bool 固定条目，画右侧矩形并跳过淘汰
 	LabelRole,					 ///< QString 用户自定义标签，显示在右上方
-	IdRole,						 ///< int 数据库唯一id
+	IdRole,						 ///< int 数据库唯一 id
+	PinRowRole,					 ///< int 条目应固定的位置（pinrow），-1 = 无
 };
 
 /**
@@ -91,6 +92,12 @@ enum HtmlClipboardRole {
  *
  * html 为空时按纯文本渲染：转义 HTML 元字符、保留换行与连续空格、自动识别超链接
  * （等价于 CopyQ ItemRender::renderAsHtml 的纯文本分支）。
+ *
+ * 语义约定：
+ *   id     —— 记录唯一标识，跨排序稳定；0 表示“未分配”，由 list 自动补齐。
+ *   pin    —— 是否已固定。
+ *   pinrow —— 条目应固定到的位置（例如第 N 行）。语义上“固定到第 N 行”，
+ *            列表重排后仍能恢复；-1 表示未固定。
  */
 struct HtmlClipboardItem {
 	QString text;		  ///< 纯文本
@@ -100,7 +107,9 @@ struct HtmlClipboardItem {
 	QString note;		  ///< 备注，渲染在内容下方
 	QString label;		  ///< 用户自定义标签，显示在行右侧
 	quint32 hash = 0;	  ///< 内容哈希，0 = 由 text+html 计算
-	int id;				  ///< 数据库唯一id
+	int id = 0;			  ///< 数据库唯一 id（0 = 未分配，由 list 分配）
+	bool pin = false;	  ///< 数据库中是否已固定
+	int pinrow = -1;	  ///< 数据库中固定到的位置（-1 = 无）
 
 	bool isValid() const { return !text.isEmpty() || !html.isEmpty(); }
 };
@@ -241,6 +250,11 @@ class HtmlItemDelegate final : public QStyledItemDelegate {
  * 保留 QListWidget 的既有用法：item(row)/currentItem()/clear()/selectedItems()
  * 等 照常可用，内容通过 HtmlClipboardItem 或对 item 调用 setData(role)
  * 写入即可富渲染。
+ *
+ * id / pin / pinrow 语义：
+ *  - id 用于跨排序稳定地定位一条记录；
+ *  - pin 表示条目被固定；
+ *  - pinrow 表示“条目应固定到第几行”，供持久化与外部恢复使用。
  */
 class HtmlClipboardList final : public QListWidget {
 	Q_OBJECT
@@ -309,12 +323,40 @@ class HtmlClipboardList final : public QListWidget {
 	/** 展开/收起某行（超长记录）。 */
 	void setRowExpanded(int row, bool expanded);
 	bool isRowExpanded(int row) const;
-	/** 固定/取消固定某行：右侧显示淡灰色矩形，并跳过超限淘汰。 */
-	void setRecordPinned(int row, bool pinned);
-	bool isRecordPinned(int row) const;
+
+	// ---- 固定 -----------------------------------------------------------
+	/**
+	 * 固定/取消固定某条记录。
+	 *
+	 * 新语义：
+	 *  - @a row  —— 条目**应固定到的位置**（pinrow），固定时存入 PinRowRole，
+	 *              取消固定时清为 -1；不会因参数名而作为查找索引。
+	 *  - @a id   —— 记录唯一标识，优先据此定位 item；仅当 id 无效/找不到时，
+	 *              才回退到按 @a row 作为行号定位（兼容旧式调用）。
+	 *  - @a pinned —— true 固定，false 取消。
+	 *
+	 * 仅修改 PinnedRole / PinRowRole 并触发重绘；「固定后是否置顶」交由
+	 * 上层在 recordPinnedChanged 里自行 moveToTop，符合 CopyQ 分层习惯。
+	 */
+	void setRecordPinned(int row, int id, bool pinned);
+	/** 按行号切换（自动取该行 id 与 pinrow）。 */
 	void toggleRecordPinned(int row);
+	/** 按 id 切换固定状态。 */
+	void toggleRecordPinnedById(int id);
+	/** 按行号查询固定状态。 */
+	bool isRecordPinned(int row) const;
+	/** 按 id 查询固定状态。 */
+	bool isRecordPinnedById(int id) const;
+	/** 某行条目的 id（无 item 返回 -1）。 */
+	int recordIdAt(int row) const;
+	/** 通过 id 反查行号（找不到返回 -1）。 */
+	int rowForId(int id) const;
+	/** 某行记录应固定的位置（pinrow）；未固定或缺失返回 -1。 */
+	int recordPinRow(int row) const;
 	/** 当前固定的记录数。 */
 	int pinnedCount() const;
+
+	// ---- 用户标签 -------------------------------------------------------
 	/** 设置/读取用户自定义标签，显示在该行右上方。 */
 	void setRecordLabel(int row, const QString &label);
 	QString recordLabel(int row) const;
@@ -332,8 +374,8 @@ class HtmlClipboardList final : public QListWidget {
 	void recordRemoved(int rowsRemoved);
 	/** 记录数变化。 */
 	void recordCountChanged(int count);
-	/** 某行的固定状态变化。 */
-	void recordPinnedChanged(int row, bool pinned);
+	/** 某行固定状态变化；同时带回 id 便于外部同步数据库。 */
+	void recordPinnedChanged(int row, int id, bool pinned);
 	/** 某行的用户标签变化。 */
 	void recordLabelChanged(int row, const QString &label);
 
@@ -360,6 +402,23 @@ class HtmlClipboardList final : public QListWidget {
 	int m_maxRecords = 0;
 	bool m_ignoreDuplicates = false;
 	QString m_filterText;
+	int m_nextAutoId = 1; ///< 自动补 id 时的起始值
+
+  private:
+	/**
+	 * 把所有被固定条目的实际行位置对齐到它的 PinRowRole。
+	 * 规则：
+	 *   1) 按 pinrow 升序排列，pinrow 相同则按当前行升序（先来先占）；
+	 *   2) 从大到小 take，再从小到大 insert，避免行号漂移；
+	 *   3) 目标位置被前面的固定项占用时顺延到下一个空位；
+	 *   4) 目标超出当前行数则追加到末尾。
+	 * 由 setRecordPinned / insertRecord / removeRow / removeSelected /
+	 * moveToTop 在最后一步调用。
+	 */
+	void relocatePinnedRows();
+
+  private:
+	bool m_relocatingPinned = false; ///< relocatePinnedRows 重入保护
 };
 
 Q_DECLARE_METATYPE(HtmlClipboardItem)
