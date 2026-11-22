@@ -53,7 +53,6 @@
 #pragma once
 
 #include <QHash>
-#include <QIcon>
 #include <QListWidget>
 #include <QMetaType>
 #include <QPixmap>
@@ -82,7 +81,9 @@ enum HtmlClipboardRole {
 	NoteRole,					 ///< QString 备注，渲染在内容下方
 	HashRole,					 ///< quint32 内容哈希（去重/置顶）
 	ExpandedRole,				 ///< bool 超长内容是否展开
-	PinnedRole,					 ///< bool 置顶保护，淘汰超限记录时跳过
+	PinnedRole,					 ///< bool 固定条目，画右侧矩形并跳过淘汰
+	LabelRole,					 ///< QString 用户自定义标签，显示在右上方
+	IdRole,						 ///< int 数据库唯一id
 };
 
 /**
@@ -96,9 +97,9 @@ struct HtmlClipboardItem {
 	QString html;		  ///< HTML 源（可为空）
 	QVariantMap formats;  ///< 其它格式，例如 image/png、text/uri-list
 	qint64 timestamp = 0; ///< 记录时间（ms）
-	QString note;		  ///< 备注/标签
+	QString note;		  ///< 备注，渲染在内容下方
+	QString label;		  ///< 用户自定义标签，显示在行右侧
 	quint32 hash = 0;	  ///< 内容哈希，0 = 由 text+html 计算
-	QIcon icon;			  ///< 可选类型图标，画在行号右侧
 
 	bool isValid() const { return !text.isEmpty() || !html.isEmpty(); }
 };
@@ -110,7 +111,8 @@ struct HtmlClipboardItem {
  *  - 每行缓存一份 QTextDocument，避免每帧重新解析 HTML；
  *  - 视图宽度变化时重排文档，并通过 sizeHintChanged 让视图刷新行高；
  *  - 模型行增删移/重置时整表回收缓存，不保留悬垂指针。
- * 另外提供：行号栏、类型图标、超长折叠 + 底部渐变、正文超链接点击。
+ * 另外提供：行号栏、右侧用户标签与固定标记、超长折叠 +
+ * 底部渐变、正文超链接点击。
  */
 class HtmlItemDelegate final : public QStyledItemDelegate {
 	Q_OBJECT
@@ -184,10 +186,12 @@ class HtmlItemDelegate final : public QStyledItemDelegate {
 		QSize size;								   ///< 含边距的整行尺寸
 		QString html;							   ///< 生成 document 用的 HTML
 		QString note;
+		QString labelText;	///< 右侧用户标签
 		int width = -1;		///< 文档可用宽度
 		int maxHeight = -1; ///< 生效的最大高度
 		int fullHeight = 0; ///< 不折叠时的正文高度
 		bool expanded = false;
+		bool pinned = false;
 		QFont font;
 	};
 
@@ -196,15 +200,18 @@ class HtmlItemDelegate final : public QStyledItemDelegate {
 						int width) const;
 	/** 重建文档与尺寸。 */
 	void rebuild(Cache &cache, const QStyleOptionViewItem &option, int width,
-				 const QString &html, const QString &note, bool expanded,
+				 const QString &html, const QString &note,
+				 const QString &labelText, bool pinned, bool expanded,
 				 const QFont &font) const;
 	/** 由调色板生成 QTextDocument 基础样式表（对应 CopyQ Theme）。 */
 	QString buildStyleSheet(const QStyleOptionViewItem &option,
 							bool selected) const;
 	/** 由记录内容组装出待渲染的 HTML。 */
 	QString composeHtml(const QListWidgetItem *item) const;
-	/** 去掉行号栏/边距后的正文宽度。 */
-	int contentWidth(int viewWidth) const;
+	/** 某行右侧用户标签文本。 */
+	QString labelForIndex(const QModelIndex &index) const;
+	/** 去掉行号栏/边距/右侧 badge 后的正文宽度。 */
+	int contentWidth(const QModelIndex &index, int viewWidth) const;
 	/** 行号栏宽度。 */
 	int gutterWidth(const QFontMetrics &fm) const;
 	/** 命中正文中的链接（无链接返回空 URL）。 */
@@ -220,7 +227,6 @@ class HtmlItemDelegate final : public QStyledItemDelegate {
 	int m_maxItemHeight = 0;
 	int m_firstRowNumber = 1;
 	int m_margin = 4;
-	int m_spacing = 6;
 	bool m_numbering = true;
 	bool m_richText = true;
 	bool m_textWrap = true;
@@ -302,6 +308,15 @@ class HtmlClipboardList final : public QListWidget {
 	/** 展开/收起某行（超长记录）。 */
 	void setRowExpanded(int row, bool expanded);
 	bool isRowExpanded(int row) const;
+	/** 固定/取消固定某行：右侧显示淡灰色矩形，并跳过超限淘汰。 */
+	void setRecordPinned(int row, bool pinned);
+	bool isRecordPinned(int row) const;
+	void toggleRecordPinned(int row);
+	/** 当前固定的记录数。 */
+	int pinnedCount() const;
+	/** 设置/读取用户自定义标签，显示在该行右上方。 */
+	void setRecordLabel(int row, const QString &label);
+	QString recordLabel(int row) const;
 	/** 内部 delegate，需要更深定制时直接取用。 */
 	HtmlItemDelegate *itemRenderer() const { return m_renderer; }
 
@@ -316,6 +331,10 @@ class HtmlClipboardList final : public QListWidget {
 	void recordRemoved(int rowsRemoved);
 	/** 记录数变化。 */
 	void recordCountChanged(int count);
+	/** 某行的固定状态变化。 */
+	void recordPinnedChanged(int row, bool pinned);
+	/** 某行的用户标签变化。 */
+	void recordLabelChanged(int row, const QString &label);
 
   protected:
 	void resizeEvent(QResizeEvent *event) override;

@@ -10,7 +10,7 @@ project(
 qt6=import('qt6')
 qt6_dep=dependency('qt6',modules:['Core','Gui','Widgets'])
 moc_files=qt6.compile_moc(
-  headers:['cliplist.h','htmlclipboardlist.h'],
+  headers:['cliplist.h','htmlclipboardlist.h','htmlclipboardbadges.h'],
   dependencies:qt6_dep
   )
 
@@ -18,6 +18,7 @@ sources = [
   'main.cpp',
   'cliplist.cpp',
   'htmlclipboardlist.cpp',
+  'htmlclipboardbadges.cpp',
 ]
 
 exe = executable(

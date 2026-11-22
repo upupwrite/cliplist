@@ -6,6 +6,7 @@
 // 只使用 Qt：QTextDocument 负责 HTML 排版，QListWidget 负责容器与选择。
 //
 #include "htmlclipboardlist.h"
+#include "htmlclipboardbadges.h"
 
 #include <QAbstractItemModel>
 #include <QAbstractTextDocumentLayout>
@@ -14,7 +15,9 @@
 #include <QContextMenuEvent>
 #include <QDateTime>
 #include <QFontMetrics>
+#include <QInputDialog>
 #include <QKeyEvent>
+#include <QLineEdit>
 #include <QLinearGradient>
 #include <QMenu>
 #include <QMimeData>
@@ -134,6 +137,10 @@ QString escapeText(const QString &text) {
 /// 只按实际存在的最大行号计算，行数增加时自动变宽，避免为多余位数留白。
 constexpr int kGutterLeftPad = 2;
 constexpr int kGutterRightPad = 4;
+
+/// 正文与右侧 badge 列之间的间距，以及用户标签与固定矩形之间的垂直间距。
+constexpr int kBadgeGap = 8;
+constexpr int kBadgeVerticalSpacing = 0;
 
 int gutterWidthFor(const QFontMetrics &fm, int rows, int firstNumber) {
 	if (rows <= 0)
@@ -303,13 +310,26 @@ int HtmlItemDelegate::gutterWidth(const QFontMetrics &fm) const {
 	return gutterWidthFor(fm, rows, m_firstRowNumber);
 }
 
-int HtmlItemDelegate::contentWidth(int viewWidth) const {
+QString HtmlItemDelegate::labelForIndex(const QModelIndex &index) const {
+	return index.data(LabelRole).toString();
+}
+
+int HtmlItemDelegate::contentWidth(const QModelIndex &index,
+								   int viewWidth) const {
 	const QFont font = m_view ? m_view->font() : qApp->font();
 	const QFontMetrics fm(font);
 
 	// 启用行号时，左侧由行号区占位；否则仍使用普通左边距。
 	const int left = m_numbering ? gutterWidth(fm) : m_margin;
-	const int width = viewWidth - left - m_margin;
+
+	// 右侧 badge 列：用户标签与固定矩形共用一列，正文不得进入该区域。
+	const QString labelText = labelForIndex(index);
+	const bool pinned = index.data(PinnedRole).toBool();
+	const int badgeWidth =
+		HtmlClipboardBadges::badgeColumnWidth(fm, pinned, labelText);
+	const int reserved = badgeWidth > 0 ? badgeWidth + kBadgeGap : 0;
+
+	const int width = viewWidth - left - m_margin - reserved;
 	return qMax(24, width);
 }
 
@@ -318,7 +338,7 @@ QSize HtmlItemDelegate::sizeHint(const QStyleOptionViewItem &option,
 	const int viewWidth = option.rect.width() > 0
 							  ? option.rect.width()
 							  : (m_textWidth > 0 ? m_textWidth : 400);
-	const int width = contentWidth(viewWidth);
+	const int width = contentWidth(index, viewWidth);
 
 	if (Cache *cache = prepareCache(index.row(), option, width))
 		return cache->size;
@@ -391,7 +411,8 @@ QString HtmlItemDelegate::composeHtml(const QListWidgetItem *item) const {
 
 void HtmlItemDelegate::rebuild(Cache &cache, const QStyleOptionViewItem &option,
 							   int width, const QString &html,
-							   const QString &note, bool expanded,
+							   const QString &note, const QString &labelText,
+							   bool pinned, bool expanded,
 							   const QFont &font) const {
 	delete cache.document;
 	delete cache.selectedDocument;
@@ -409,9 +430,11 @@ void HtmlItemDelegate::rebuild(Cache &cache, const QStyleOptionViewItem &option,
 	cache.document = document;
 	cache.html = html;
 	cache.note = note;
+	cache.labelText = labelText;
 	cache.width = width;
 	cache.maxHeight = m_maxItemHeight;
 	cache.expanded = expanded;
+	cache.pinned = pinned;
 	cache.font = font;
 
 	cache.fullHeight = static_cast<int>(std::ceil(document->size().height()));
@@ -422,10 +445,15 @@ void HtmlItemDelegate::rebuild(Cache &cache, const QStyleOptionViewItem &option,
 		height = m_maxItemHeight;
 	height = qMax(height, fm.height());
 
+	// 用户标签在上、固定矩形在下；内容太短时行高扩展以容纳 badge。
+	const int badgeHeight = HtmlClipboardBadges::minimumRowHeight(
+		fm, pinned, labelText, m_margin, kBadgeVerticalSpacing);
+	height = qMax(height + 2 * m_margin, badgeHeight);
+
 	int rowWidth = width + m_margin;
 	if (m_numbering)
 		rowWidth += gutterWidth(fm);
-	cache.size = QSize(qMax(rowWidth, 40), height + 2 * m_margin);
+	cache.size = QSize(qMax(rowWidth, 40), height);
 }
 
 HtmlItemDelegate::Cache *
@@ -442,6 +470,8 @@ HtmlItemDelegate::prepareCache(int row, const QStyleOptionViewItem &option,
 	const QString html = composeHtml(item);
 	const QString note = item->data(NoteRole).toString();
 	const bool expanded = item->data(ExpandedRole).toBool();
+	const bool pinned = item->data(PinnedRole).toBool();
+	const QString labelText = item->data(LabelRole).toString();
 
 	QFont font = option.font;
 	const QVariant fontData = item->data(Qt::FontRole);
@@ -458,10 +488,12 @@ HtmlItemDelegate::prepareCache(int row, const QStyleOptionViewItem &option,
 	const bool stale = cache.width != width ||
 					   cache.maxHeight != m_maxItemHeight ||
 					   cache.expanded != expanded || cache.html != html ||
-					   cache.note != note || cache.font != font;
+					   cache.note != note || cache.labelText != labelText ||
+					   cache.pinned != pinned || cache.font != font;
 
 	if (stale)
-		rebuild(cache, option, width, html, note, expanded, font);
+		rebuild(cache, option, width, html, note, labelText, pinned, expanded,
+				font);
 
 	return &cache;
 }
@@ -509,7 +541,7 @@ void HtmlItemDelegate::paint(QPainter *painter,
 		painter->drawRect(option.rect.adjusted(0, 0, -1, -1));
 	}
 
-	const int width = contentWidth(option.rect.width());
+	const int width = contentWidth(index, option.rect.width());
 	Cache *cache = prepareCache(index.row(), option, width);
 	if (!cache || !cache->document) {
 		painter->restore();
@@ -536,14 +568,6 @@ void HtmlItemDelegate::paint(QPainter *painter,
 						  QString::number(m_firstRowNumber + index.row()));
 
 		x = option.rect.left() + gutter;
-	}
-
-	// 类型图标
-	const QIcon icon = index.data(Qt::DecorationRole).value<QIcon>();
-	if (!icon.isNull()) {
-		const int size = fm.height();
-		icon.paint(painter, x, option.rect.top() + m_margin, size, size);
-		x += size + m_spacing;
 	}
 
 	// 选中态文档惰性构建（同一份 HTML，只换配色）
@@ -591,6 +615,13 @@ void HtmlItemDelegate::paint(QPainter *painter,
 	}
 	painter->restore();
 
+	// 右侧 badge：用户标签在右上，固定矩形在其下方，二者与正文宽度互不重叠。
+	const auto badgeLayout = HtmlClipboardBadges::layout(
+		option.rect, fm, cache->pinned, cache->labelText, m_margin,
+		kBadgeVerticalSpacing);
+	HtmlClipboardBadges::paint(painter, option, badgeLayout, cache->labelText,
+							   cache->pinned, selected);
+
 	painter->restore();
 }
 
@@ -600,7 +631,7 @@ bool HtmlItemDelegate::editorEvent(QEvent *event, QAbstractItemModel *model,
 	if (event->type() == QEvent::MouseButtonRelease) {
 		auto *mouse = static_cast<QMouseEvent *>(event);
 		if (mouse->button() == Qt::LeftButton) {
-			const int width = contentWidth(option.rect.width());
+			const int width = contentWidth(index, option.rect.width());
 			if (Cache *cache = prepareCache(index.row(), option, width)) {
 #if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
 				const QPointF pos = mouse->position();
@@ -615,9 +646,6 @@ bool HtmlItemDelegate::editorEvent(QEvent *event, QAbstractItemModel *model,
 					local.setX(local.x() - gutterWidth(fm));
 				else
 					local.setX(local.x() - m_margin);
-
-				if (!index.data(Qt::DecorationRole).value<QIcon>().isNull())
-					local.setX(local.x() - (fm.height() + m_spacing));
 
 				const QUrl url = urlAt(*cache, option, local,
 									   option.state & QStyle::State_Selected);
@@ -671,7 +699,8 @@ int HtmlItemDelegate::fullHeightOf(const QModelIndex &index, int width) {
 	option.font = m_view->font();
 	option.rect = QRect(0, 0, width, 0);
 
-	Cache *cache = prepareCache(index.row(), option, contentWidth(width));
+	Cache *cache =
+		prepareCache(index.row(), option, contentWidth(index, width));
 	return cache ? cache->fullHeight : 0;
 }
 
@@ -748,12 +777,9 @@ void HtmlClipboardList::fillItem(QListWidgetItem *item,
 								? record.hash
 								: contentHash(record.text, record.html));
 	item->setData(ExpandedRole, false);
+	item->setData(LabelRole, record.label);
 	item->setData(Qt::DisplayRole, QVariant()); // 内容一律由 delegate 绘制
 	item->setData(Qt::TextAlignmentRole, QVariant());
-	if (!record.icon.isNull())
-		item->setData(Qt::DecorationRole, record.icon);
-	else
-		item->setData(Qt::DecorationRole, QVariant());
 	item->setToolTip(QString());
 }
 
@@ -835,7 +861,7 @@ int HtmlClipboardList::appendFromMimeData(const QMimeData *mimeData) {
 	if (record.text.isEmpty() && mimeData->hasUrls())
 		record.text = mimeData->urls().value(0).toString();
 
-	// 图片记录：存原字节并生成缩略图标
+	// 图片记录：保留原始字节；不再生成缩略图标，标签由用户自行设置。
 	for (const QByteArray &imageFormat :
 		 {QByteArrayLiteral("image/png"), QByteArrayLiteral("image/jpeg"),
 		  QByteArrayLiteral("image/bmp"), QByteArrayLiteral("image/gif")}) {
@@ -843,14 +869,14 @@ int HtmlClipboardList::appendFromMimeData(const QMimeData *mimeData) {
 			record.formats.value(QString::fromLatin1(imageFormat));
 		if (value.isNull())
 			continue;
-		QPixmap pixmap;
-		if (pixmap.loadFromData(value.toByteArray())) {
-			record.icon = QIcon(pixmap.scaled(32, 32, Qt::KeepAspectRatio,
-											  Qt::SmoothTransformation));
-			if (record.text.isEmpty()) {
+		if (record.text.isEmpty()) {
+			QPixmap pixmap;
+			if (pixmap.loadFromData(value.toByteArray())) {
 				record.text = QStringLiteral("[image %1x%2]")
 								  .arg(pixmap.width())
 								  .arg(pixmap.height());
+			} else {
+				record.text = QStringLiteral("[图片]");
 			}
 		}
 		break;
@@ -897,8 +923,8 @@ HtmlClipboardItem HtmlClipboardList::recordAt(int row) const {
 	record.formats = item->data(FormatsRole).toMap();
 	record.timestamp = item->data(TimestampRole).toLongLong();
 	record.note = item->data(NoteRole).toString();
+	record.label = item->data(LabelRole).toString();
 	record.hash = item->data(HashRole).toUInt();
-	record.icon = item->data(Qt::DecorationRole).value<QIcon>();
 	return record;
 }
 
@@ -1081,6 +1107,51 @@ bool HtmlClipboardList::isRowExpanded(int row) const {
 	return item ? item->data(ExpandedRole).toBool() : false;
 }
 
+void HtmlClipboardList::setRecordPinned(int row, bool pinned) {
+	QListWidgetItem *item = this->item(row);
+	if (!item || item->data(PinnedRole).toBool() == pinned)
+		return;
+
+	item->setData(PinnedRole, pinned);
+	m_renderer->invalidateRow(model()->index(row, 0));
+	doItemsLayout();
+	emit recordPinnedChanged(row, pinned);
+}
+
+bool HtmlClipboardList::isRecordPinned(int row) const {
+	const QListWidgetItem *item = this->item(row);
+	return item ? item->data(PinnedRole).toBool() : false;
+}
+
+void HtmlClipboardList::toggleRecordPinned(int row) {
+	setRecordPinned(row, !isRecordPinned(row));
+}
+
+int HtmlClipboardList::pinnedCount() const {
+	int pinned = 0;
+	for (int row = 0; row < count(); ++row) {
+		if (isRecordPinned(row))
+			++pinned;
+	}
+	return pinned;
+}
+
+void HtmlClipboardList::setRecordLabel(int row, const QString &label) {
+	QListWidgetItem *item = this->item(row);
+	if (!item || item->data(LabelRole).toString() == label)
+		return;
+
+	item->setData(LabelRole, label);
+	m_renderer->invalidateRow(model()->index(row, 0));
+	doItemsLayout();
+	emit recordLabelChanged(row, label);
+}
+
+QString HtmlClipboardList::recordLabel(int row) const {
+	const QListWidgetItem *item = this->item(row);
+	return item ? item->data(LabelRole).toString() : QString();
+}
+
 // ---- 事件 ---------------------------------------------------------------
 
 void HtmlClipboardList::resizeEvent(QResizeEvent *event) {
@@ -1137,11 +1208,13 @@ void HtmlClipboardList::contextMenuEvent(QContextMenuEvent *event) {
 	actCopyText->setEnabled(row >= 0);
 	QAction *actExpand = menu.addAction(tr("展开/收起"));
 	actExpand->setEnabled(row >= 0 && m_renderer->maxItemHeight() > 0);
-	QAction *actPin = menu.addAction(tr("置顶保护"));
+	QAction *actPin = menu.addAction(tr("固定条目"));
 	actPin->setCheckable(true);
 	actPin->setEnabled(row >= 0);
 	if (row >= 0)
-		actPin->setChecked(item(row)->data(PinnedRole).toBool());
+		actPin->setChecked(isRecordPinned(row));
+	QAction *actLabel = menu.addAction(tr("设置标签..."));
+	actLabel->setEnabled(row >= 0);
 	menu.addSeparator();
 	QAction *actRemove = menu.addAction(tr("删除所选"));
 	actRemove->setEnabled(selectedCount() > 0);
@@ -1163,7 +1236,14 @@ void HtmlClipboardList::contextMenuEvent(QContextMenuEvent *event) {
 	} else if (chosen == actExpand) {
 		setRowExpanded(row, !isRowExpanded(row));
 	} else if (chosen == actPin) {
-		item(row)->setData(PinnedRole, actPin->isChecked());
+		setRecordPinned(row, actPin->isChecked());
+	} else if (chosen == actLabel) {
+		bool ok = false;
+		const QString label =
+			QInputDialog::getText(this, tr("设置标签"), tr("标签文本："),
+								  QLineEdit::Normal, recordLabel(row), &ok);
+		if (ok)
+			setRecordLabel(row, label);
 	} else if (chosen == actRemove) {
 		removeSelected();
 	} else if (chosen == actClear) {
