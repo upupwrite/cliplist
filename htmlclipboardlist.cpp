@@ -778,6 +778,7 @@ void HtmlClipboardList::fillItem(QListWidgetItem *item,
 								: contentHash(record.text, record.html));
 	item->setData(ExpandedRole, false);
 	item->setData(LabelRole, record.label);
+	item->setData(IdRole, record.id);
 	item->setData(Qt::DisplayRole, QVariant()); // 内容一律由 delegate 绘制
 	item->setData(Qt::TextAlignmentRole, QVariant());
 	item->setToolTip(QString());

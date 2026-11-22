@@ -100,6 +100,7 @@ struct HtmlClipboardItem {
 	QString note;		  ///< 备注，渲染在内容下方
 	QString label;		  ///< 用户自定义标签，显示在行右侧
 	quint32 hash = 0;	  ///< 内容哈希，0 = 由 text+html 计算
+	int id;				  ///< 数据库唯一id
 
 	bool isValid() const { return !text.isEmpty() || !html.isEmpty(); }
 };
